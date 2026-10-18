@@ -815,6 +815,46 @@ pub unsafe extern "C" fn smoothmx_hardware_stop(handle: *mut HardwareHandle) {
         let _ = worker.join();
     }
 }
+
+/// Read battery level and charging status from a device by registry ID.
+/// Returns a freshly allocated UTF-8 JSON string; the caller is responsible for freeing it via `smoothmx_hardware_free`.
+/// Pass `0` as `registry_id` to return null.
+/// # Safety
+/// The caller must ensure `registry_id` points to a valid HID++ mouse on this system.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smoothmx_hardware_battery_read(
+    registry_id: u64,
+) -> *mut c_char {
+    if registry_id == 0 {
+        return ptr::null_mut();
+    }
+    let json = (|| -> Result<String, String> {
+        let mut s = Session::open(
+            registry_id,
+            None,
+            0,
+            Arc::new(Mutex::new(HardwareControl::default())),
+        )?;
+        s.probe()?;
+        Ok(s.battery_snapshot())
+    })();
+    match json {
+        Ok(s) => CString::new(s.as_bytes()).map(|c| c.into_raw()).unwrap_or(ptr::null_mut()),
+        Err(_) => CString::new("{\"battery\":null}").map(|c| c.into_raw()).unwrap_or(ptr::null_mut()),
+    }
+}
+
+/// Free a JSON string returned by `smoothmx_hardware_battery_read`.
+/// # Safety
+/// The pointer must be a valid UTF-8 null-terminated string returned by this library,
+/// or `null` (the function is a no-op for null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smoothmx_hardware_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        let _ = unsafe { CString::from_raw(ptr) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

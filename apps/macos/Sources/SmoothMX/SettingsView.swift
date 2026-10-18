@@ -26,6 +26,16 @@ struct SettingsView: View {
                 if model.active { Label("Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
                 if model.busy { ProgressView().controlSize(.small) }
             }
+            HStack(spacing: 24) {
+                if let battery = model.batteryInfo, let level = battery.levelPercent {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("\(level)%", systemImage: battery.charging == true ? "batterycharging.full" : "battery.100")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ProgressView(value: Double(level), value: 100)
+                            .progressViewStyle(.linear)
+                    }
+                }
+            }
             TabView(selection: $tab) {
                 pointAndScroll.tabItem { Text("Point & Scroll") }.tag(0)
                 buttons.tabItem { Text("Buttons & Gestures") }.tag(1)

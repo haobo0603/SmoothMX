@@ -1,7 +1,14 @@
 import AppKit
-import ApplicationServices
 import CSmoothMX
+import Darwin
 
+struct BatteryInfo: Decodable, Sendable {
+    let levelPercent: Int?
+    let charging: Bool?
+}
+private struct BatteryWrapper: Decodable {
+    let battery: BatteryInfo?
+}
 struct HardwareButton: Decodable {
     let id: UInt16
     let divertable: Bool
@@ -89,5 +96,17 @@ final class HardwareSession {
         guard settings.words.withUnsafeBufferPointer({ smoothmx_hardware_apply(handle, $0.baseAddress, $0.count) }) == 0 else { throw ConfigurationError.invalid }
     }
     func restore() { _ = smoothmx_hardware_apply(handle, nil, 0) }
+    static func battery(registryID: UInt64) -> BatteryInfo? {
+        let json = smoothmx_hardware_battery_read(registryID)
+        defer { smoothmx_hardware_free(json) }
+        guard let json, strlen(json) > 0 else { return nil }
+        let data = Data(bytes: json, count: strlen(json))
+        do {
+            let wrapper = try JSONDecoder().decode(BatteryWrapper.self, from: data)
+            return wrapper.battery
+        } catch {
+            return nil
+        }
+    }
     deinit { smoothmx_hardware_stop(handle); Unmanaged<HardwareCallbacks>.fromOpaque(context).release() }
 }

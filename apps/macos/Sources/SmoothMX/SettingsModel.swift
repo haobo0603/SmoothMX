@@ -8,6 +8,7 @@ final class SettingsModel: ObservableObject {
     @Published var profiles = [ApplicationProfile.global]
     @Published var selectedProfile = "*"
     @Published private(set) var capabilities: HardwareSnapshot?
+    @Published private(set) var batteryInfo: BatteryInfo?
     @Published private(set) var deviceID: String?
     @Published private(set) var busy = false
     @Published private(set) var active = false
@@ -24,6 +25,7 @@ final class SettingsModel: ObservableObject {
     private var currentProfileID: String?
     private var loadedSettings = false
     private var sessionFailed = false
+    private var registryID: UInt64?
     private static var file: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SmoothMX/settings.json")
@@ -49,9 +51,9 @@ final class SettingsModel: ObservableObject {
         message = "Reading supported controls and current settings…"
         let id = UInt64(device.id.replacingOccurrences(of: "hid-", with: ""), radix: 16)
         guard let id, device.transport.contains("Bluetooth") else {
-            busy = false; message = "Hardware settings currently support direct Bluetooth connections."; return
+            registryID = nil; busy = false; message = "Hardware settings currently support direct Bluetooth connections."; return
         }
-        generation = UUID(); let token = generation
+        registryID = id; generation = UUID(); let token = generation
         do {
             session = try HardwareSession(registryID: id) { [weak self] data in
                 Task { @MainActor [weak self] in
@@ -92,7 +94,15 @@ final class SettingsModel: ObservableObject {
             }
             message = result.applied ? "Customization active · \(activeProfile)" : "Ready. Original settings are preserved until you apply changes."
             if desiredActive { applyForegroundIfNeeded() }
+            // Fetch battery info asynchronously when capabilities are ready.
+            if result.ready || (result.error != nil) {
+                Task { await self.fetchBattery() }
+            }
         } catch { busy = false; message = "Invalid capability response: \(error.localizedDescription)" }
+    }
+    private func fetchBattery() async {
+        guard let registryID, !busy else { return }
+        batteryInfo = HardwareSession.battery(registryID: registryID)
     }
     func applySelected() {
         guard let session, capabilities?.ready == true, !busy else { return }
