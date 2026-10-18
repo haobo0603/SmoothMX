@@ -126,12 +126,22 @@ struct Capabilities {
     vertical: u8,
     horizontal: u8,
     controls: u8,
+    battery: u8,
     dpi_values: Vec<u16>,
     current_dpi: u16,
     smart_state: [u8; 16],
     vertical_state: u8,
     horizontal_state: [u8; 2],
     buttons: Vec<Button>,
+}
+
+/// Battery level read from the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryInfo {
+    /// Percentage (0–100), or 0 if unreadable.
+    pub level_percent: u8,
+    /// true when the device is connected to a power source.
+    pub charging: bool,
 }
 pub struct Session {
     device: Owned,
@@ -254,12 +264,14 @@ impl Session {
         let vertical = self.feature(0x2121)?;
         let horizontal = self.feature(0x2150)?;
         let controls = self.feature(0x1b04)?;
+        let battery = self.feature(0x0015)?;
         let mut caps = Capabilities {
             dpi,
             smart,
             vertical,
             horizontal,
             controls,
+            battery,
             dpi_values: vec![],
             current_dpi: 0,
             smart_state: [0; 16],
@@ -312,6 +324,22 @@ impl Session {
         self.caps = Some(caps);
         Ok(())
     }
+    /// Read battery level and charging status from the device.
+    pub fn read_battery(&self) -> Option<BatteryInfo> {
+        let c = self.caps.as_ref()?;
+        if c.battery == 0 {
+            return None;
+        }
+        let p = self.request(c.battery, 0, &[]).ok()?;
+        // HID++ Battery feature (0x0015): byte[0] = level (0-100), byte[1] = status flags
+        // Status: bit 0 = 1 when charging
+        let level_percent = p[0];
+        let charging = p[1] & 0x01 != 0;
+        Some(BatteryInfo {
+            level_percent,
+            charging,
+        })
+    }
     fn snapshot(&self, applied: bool, error: Option<&str>) -> String {
         let Some(c) = &self.caps else {
             return format!(
@@ -344,6 +372,22 @@ impl Session {
             buttons,
             error.map(json_string).unwrap_or("null".into())
         )
+    }
+    /// Return battery snapshot as JSON string.
+    pub fn battery_snapshot(&self) -> String {
+        let Some(c) = &self.caps else {
+            return "{\"battery\":null}".to_string();
+        };
+        if c.battery == 0 {
+            return "{\"battery\":null}".to_string();
+        }
+        match self.read_battery() {
+            Some(bat) => format!(
+                "{{\"battery\":{{\"level_percent\":{},\"charging\":{}}}}}",
+                bat.level_percent, bat.charging
+            ),
+            None => "{\"battery\":null}".to_string(),
+        }
     }
     fn apply(&mut self, settings: Settings) -> Result<(), String> {
         let c = self.caps.as_ref().ok_or("Capabilities not available")?;
@@ -440,12 +484,12 @@ impl Session {
             }
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(ref e) = result {
             let cleanup = self.restore();
-            if let Err(e) = cleanup {
+            if let Err(cleanup_err) = cleanup {
                 return Err(format!(
-                    "{}; restoration also failed: {e}. Power-cycle the mouse.",
-                    result.unwrap_err()
+                    "{}; restoration also failed: {cleanup_err}. Power-cycle the mouse.",
+                    e
                 ));
             }
         }
@@ -469,20 +513,20 @@ impl Session {
                 }
             }
         }
-        if c.vertical != 0 {
-            if let Err(e) = self.request(c.vertical, 2, &[c.vertical_state]) {
-                errors.push(e);
-            }
+        if c.vertical != 0
+            && let Err(e) = self.request(c.vertical, 2, &[c.vertical_state])
+        {
+            errors.push(e);
         }
-        if c.horizontal != 0 {
-            if let Err(e) = self.request(c.horizontal, 2, &c.horizontal_state) {
-                errors.push(e);
-            }
+        if c.horizontal != 0
+            && let Err(e) = self.request(c.horizontal, 2, &c.horizontal_state)
+        {
+            errors.push(e);
         }
-        if c.smart != 0 {
-            if let Err(e) = self.request(c.smart, 1, &[c.smart_state[0], c.smart_state[1], 0]) {
-                errors.push(e);
-            }
+        if c.smart != 0
+            && let Err(e) = self.request(c.smart, 1, &[c.smart_state[0], c.smart_state[1], 0])
+        {
+            errors.push(e);
         }
         if c.dpi != 0 {
             let d = c.current_dpi.to_be_bytes();
@@ -521,8 +565,10 @@ impl Drop for Session {
 }
 fn decode_dpi(p: &[u8; 16]) -> Result<Vec<u16>, String> {
     let values = p[1..13]
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_be_bytes([c[0], c[1]]))
         .take_while(|v| *v != 0)
         .collect::<Vec<_>>();
     if values.len() == 3 && values[1] > 0xe000 {
@@ -546,6 +592,18 @@ pub fn probe(id: u64) -> Result<String, String> {
     )?;
     s.probe()?;
     Ok(s.snapshot(false, None))
+}
+
+/// Read battery information from a device by registry ID.
+pub fn battery(id: u64) -> Result<String, String> {
+    let mut s = Session::open(
+        id,
+        None,
+        0,
+        Arc::new(Mutex::new(HardwareControl::default())),
+    )?;
+    s.probe()?;
+    Ok(s.battery_snapshot())
 }
 
 #[derive(Default)]
@@ -641,20 +699,19 @@ fn hardware_run(
                     ),
                 );
             }
-            if session.rx.toggle.replace(false) {
-                if let Some(c) = &session.caps {
-                    if c.smart != 0 {
-                        let result = session.request(c.smart, 0, &[]).and_then(|p| {
-                            session.request(c.smart, 1, &[if p[0] == 1 { 2 } else { 1 }, 0, 0])
-                        });
-                        if let Err(e) = result {
-                            emit(
-                                callback,
-                                context,
-                                &session.snapshot(session.changed, Some(&e)),
-                            );
-                        }
-                    }
+            if session.rx.toggle.replace(false)
+                && let Some(c) = &session.caps
+                && c.smart != 0
+            {
+                let result = session.request(c.smart, 0, &[]).and_then(|p| {
+                    session.request(c.smart, 1, &[if p[0] == 1 { 2 } else { 1 }, 0, 0])
+                });
+                if let Err(e) = result {
+                    emit(
+                        callback,
+                        context,
+                        &session.snapshot(session.changed, Some(&e)),
+                    );
                 }
             }
             // Source is persistent: a signal before the wait is not lost.
@@ -774,5 +831,14 @@ mod tests {
         let mut p = [0; 16];
         p[1..7].copy_from_slice(&[0, 200, 0xe0, 0, 0x0f, 0xa0]);
         assert!(decode_dpi(&p).is_err());
+    }
+    #[test]
+    fn battery_info_struct_clippy() {
+        let bat = BatteryInfo {
+            level_percent: 75,
+            charging: true,
+        };
+        assert_eq!(bat.level_percent, 75);
+        assert!(bat.charging);
     }
 }

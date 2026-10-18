@@ -35,6 +35,19 @@ fn main() -> ExitCode {
                 }
             }
         }
+        [command, id] if command == "battery" => {
+            let id = id.trim_start_matches("hid-");
+            match u64::from_str_radix(id, 16)
+                .map_err(|e| e.to_string())
+                .and_then(smoothmx_platform_macos::hardware::battery)
+            {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    eprintln!("Battery read failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown command. Run smoothmx --help.");
             return ExitCode::from(2);
@@ -45,7 +58,7 @@ fn main() -> ExitCode {
 
 fn help() {
     println!("SmoothMX — macOS mouse discovery");
-    println!("Usage: smoothmx [--help | --version | doctor | devices [--json]]");
+    println!("Usage: smoothmx [--help | --version | doctor | devices [--json] | battery <hid-id>]");
 }
 
 fn devices(json: bool) -> ExitCode {
