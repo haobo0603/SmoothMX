@@ -822,9 +822,7 @@ pub unsafe extern "C" fn smoothmx_hardware_stop(handle: *mut HardwareHandle) {
 /// # Safety
 /// The caller must ensure `registry_id` points to a valid HID++ mouse on this system.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn smoothmx_hardware_battery_read(
-    registry_id: u64,
-) -> *mut c_char {
+pub unsafe extern "C" fn smoothmx_hardware_battery_read(registry_id: u64) -> *mut c_char {
     if registry_id == 0 {
         return ptr::null_mut();
     }
@@ -839,8 +837,12 @@ pub unsafe extern "C" fn smoothmx_hardware_battery_read(
         Ok(s.battery_snapshot())
     })();
     match json {
-        Ok(s) => CString::new(s.as_bytes()).map(|c| c.into_raw()).unwrap_or(ptr::null_mut()),
-        Err(_) => CString::new("{\"battery\":null}").map(|c| c.into_raw()).unwrap_or(ptr::null_mut()),
+        Ok(s) => CString::new(s.as_bytes())
+            .map(|c| c.into_raw())
+            .unwrap_or(ptr::null_mut()),
+        Err(_) => CString::new("{\"battery\":null}")
+            .map(|c| c.into_raw())
+            .unwrap_or(ptr::null_mut()),
     }
 }
 
