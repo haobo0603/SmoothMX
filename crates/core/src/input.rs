@@ -125,10 +125,10 @@ pub struct InputEngine {
 impl InputEngine {
     pub fn release_all(&mut self, mut emit: impl FnMut(Output)) {
         for i in 0..5 {
-            if self.pressed[i] && !self.captured[i].gesture {
-                if let Some(event) = self.captured[i].actions[0].output(false) {
-                    emit(event);
-                }
+            if self.pressed[i] && !self.captured[i].gesture
+                && let Some(event) = self.captured[i].actions[0].output(false)
+            {
+                emit(event);
             }
         }
         self.pressed = [false; 5];
@@ -145,10 +145,10 @@ impl InputEngine {
             if down {
                 self.captured[i] = s.bindings[i];
                 self.gesture_xy[i] = (0, 0);
-                if self.captured[i].enabled && !self.captured[i].gesture {
-                    if let Some(event) = self.captured[i].actions[0].output(true) {
-                        emit(event);
-                    }
+                if self.captured[i].enabled && !self.captured[i].gesture
+                    && let Some(event) = self.captured[i].actions[0].output(true)
+                {
+                    emit(event);
                 }
             } else if self.captured[i].enabled {
                 let b = self.captured[i];
