@@ -1,0 +1,11 @@
+[package]
+name = "smoothmx-platform-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+smoothmx-core = { path = "../core" }

@@ -1,0 +1,5 @@
+/target/
+/apps/macos/.build/
+.DS_Store
+DerivedData/
+*.xcuserstate
