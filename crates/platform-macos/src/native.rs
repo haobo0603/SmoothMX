@@ -3,6 +3,7 @@
 use std::ffi::{c_char, c_void};
 pub type Ref = *const c_void;
 pub type DeviceCallback = unsafe extern "C" fn(*mut c_void, i32, Ref, Ref);
+pub type HidCallback = unsafe extern "C" fn(*mut c_void, i32, Ref);
 #[repr(C)]
 pub struct SourceContext {
     pub version: isize,
@@ -92,6 +93,11 @@ unsafe extern "C" {
         report: *mut u8,
         length: isize,
         callback: Option<ReportCallback>,
+        context: *mut c_void,
+    );
+    pub fn IOHIDDeviceRegisterRemovalCallback(
+        device: Ref,
+        callback: Option<HidCallback>,
         context: *mut c_void,
     );
     pub fn IOHIDDeviceSetReport(

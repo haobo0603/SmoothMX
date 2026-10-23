@@ -65,14 +65,24 @@ fn property(device: Ref, key: &str) -> Ref {
     unsafe { IOHIDDeviceGetProperty(device, key.0) }
 }
 fn number(device: Ref, key: &str) -> u32 {
+    optional_number(device, key).unwrap_or_default()
+}
+fn optional_number(device: Ref, key: &str) -> Option<u32> {
     unsafe {
         let value = property(device, key);
         let mut result: i32 = 0;
-        if !value.is_null() && CFGetTypeID(value) == CFNumberGetTypeID() {
-            CFNumberGetValue(value, SINT32, (&mut result as *mut i32).cast());
+        if value.is_null()
+            || CFGetTypeID(value) != CFNumberGetTypeID()
+            || CFNumberGetValue(value, SINT32, (&mut result as *mut i32).cast()) == 0
+            || result < 0
+        {
+            return None;
         }
-        result as u32
+        Some(result as u32)
     }
+}
+fn valid_battery_level(level: u32) -> Option<u8> {
+    (level <= 100).then_some(level as u8)
 }
 fn string(device: Ref, key: &str) -> Option<String> {
     unsafe {
@@ -159,6 +169,7 @@ fn read_interface(device: Ref) -> Option<HidInterface> {
         } else {
             number(device, "PrimaryUsage")
         },
+        battery_level: optional_number(device, "BatteryLevel").and_then(valid_battery_level),
     })
 }
 fn interfaces(manager: Ref) -> BTreeMap<usize, HidInterface> {
@@ -369,6 +380,7 @@ mod tests {
             location_id: 0,
             usage_page: 1,
             usage: 2,
+            battery_level: None,
         };
         let mut state = State {
             devices: BTreeMap::from([(123usize, record)]),
@@ -416,6 +428,12 @@ mod tests {
             smoothmx_discovery_stop(handle);
             assert!(received.is_ok());
         }
+    }
+    #[test]
+    fn battery_property_preserves_zero_and_rejects_invalid_percentage() {
+        assert_eq!(valid_battery_level(0), Some(0));
+        assert_eq!(valid_battery_level(100), Some(100));
+        assert_eq!(valid_battery_level(101), None);
     }
 }
 

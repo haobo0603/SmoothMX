@@ -12,18 +12,79 @@ struct Packet {
     bytes: [u8; 20],
     len: usize,
 }
+
+const HIDPP_SHORT_REPORT: u8 = 0x10;
+const HIDPP_LONG_REPORT: u8 = 0x11;
+const HIDPP_SHORT_LENGTH: usize = 7;
+const HIDPP_LONG_LENGTH: usize = 20;
+
+fn normalize_report(report_id: u32, data: &[u8]) -> Option<Packet> {
+    let report_id = u8::try_from(report_id).ok()?;
+    let expected = match report_id {
+        HIDPP_SHORT_REPORT => HIDPP_SHORT_LENGTH,
+        HIDPP_LONG_REPORT => HIDPP_LONG_LENGTH,
+        _ => return None,
+    };
+    let mut packet = Packet {
+        bytes: [0; HIDPP_LONG_LENGTH],
+        len: expected,
+    };
+    if data.len() == expected && data.first() == Some(&report_id) {
+        packet.bytes[..expected].copy_from_slice(data);
+    } else if data.len() == expected - 1 {
+        packet.bytes[0] = report_id;
+        packet.bytes[1..expected].copy_from_slice(data);
+    } else {
+        return None;
+    }
+    Some(packet)
+}
+
+fn encode_request(
+    feature: u8,
+    function: u8,
+    sequence: u8,
+    parameters: &[u8],
+) -> Result<Packet, String> {
+    if function > 0x0f {
+        return Err("HID++ function index is out of range".into());
+    }
+    if !(1..=0x0f).contains(&sequence) {
+        return Err("HID++ software ID is out of range".into());
+    }
+    if parameters.len() > HIDPP_LONG_LENGTH - 4 {
+        return Err("HID++ request too large".into());
+    }
+    let mut packet = Packet {
+        bytes: [0; HIDPP_LONG_LENGTH],
+        len: HIDPP_LONG_LENGTH,
+    };
+    packet.bytes[..4].copy_from_slice(&[
+        HIDPP_LONG_REPORT,
+        0xff,
+        feature,
+        (function << 4) | sequence,
+    ]);
+    packet.bytes[4..4 + parameters.len()].copy_from_slice(parameters);
+    Ok(packet)
+}
+
 struct Rx {
     expected: Cell<Option<(u8, u8)>>,
     response: RefCell<Option<Result<[u8; 16], String>>>,
     controls: Cell<u8>,
     vertical: Cell<u8>,
     horizontal: Cell<u8>,
+    battery_unified: Cell<u8>,
+    battery_legacy: Cell<u8>,
+    battery_update: Cell<Option<BatteryInfo>>,
     vertical_multiplier: Cell<f64>,
     horizontal_multiplier: Cell<f64>,
     engine: RefCell<InputEngine>,
     output: Option<OutputCallback>,
     context: usize,
     toggle: Cell<bool>,
+    disconnected: Cell<bool>,
 }
 impl Rx {
     fn emit(&self, event: Output) {
@@ -34,7 +95,10 @@ impl Rx {
         }
     }
     fn packet(&self, p: &[u8]) {
-        if p.len() < 7 || ![0x10, 0x11].contains(&p[0]) || p[1] != 0xff {
+        if !matches!(p.len(), HIDPP_SHORT_LENGTH | HIDPP_LONG_LENGTH)
+            || ![HIDPP_SHORT_REPORT, HIDPP_LONG_REPORT].contains(&p[0])
+            || p[1] != 0xff
+        {
             return;
         }
         if let Some((feature, function)) = self.expected.get() {
@@ -42,18 +106,32 @@ impl Rx {
                 let mut response = [0; 16];
                 let n = (p.len() - 4).min(16);
                 response[..n].copy_from_slice(&p[4..4 + n]);
-                *self.response.borrow_mut() = Some(Ok(response));
+                self.complete(Ok(response));
                 return;
             }
             if p[2] == 0xff && p[3] == feature && p[4] == function {
-                *self.response.borrow_mut() = Some(Err(format!("HID++ error 0x{:02X}", p[5])));
+                self.complete(Err(format!("HID++ error 0x{:02X}", p[5])));
                 return;
             }
         }
         if p[3] & 15 != 0 {
             return;
         }
-        if p[2] == self.controls.get() && self.controls.get() != 0 {
+        if p[2] == self.battery_unified.get() && self.battery_unified.get() != 0 {
+            let mut status = [0; 16];
+            let count = (p.len() - 4).min(status.len());
+            status[..count].copy_from_slice(&p[4..4 + count]);
+            if let Some(update) = parse_unified_battery(&status) {
+                self.battery_update.set(Some(update));
+            }
+        } else if p[2] == self.battery_legacy.get() && self.battery_legacy.get() != 0 {
+            let mut status = [0; 16];
+            let count = (p.len() - 4).min(status.len());
+            status[..count].copy_from_slice(&p[4..4 + count]);
+            if let Some(update) = parse_legacy_battery(&status) {
+                self.battery_update.set(Some(update));
+            }
+        } else if p[2] == self.controls.get() && self.controls.get() != 0 {
             if p[3] >> 4 == 0 && p.len() >= 12 {
                 let ids = [
                     u16::from_be_bytes([p[4], p[5]]),
@@ -89,6 +167,13 @@ impl Rx {
             );
         }
     }
+
+    fn complete(&self, result: Result<[u8; 16], String>) {
+        let mut response = self.response.borrow_mut();
+        if response.is_none() {
+            *response = Some(result);
+        }
+    }
 }
 unsafe extern "C" fn report(
     context: *mut c_void,
@@ -99,18 +184,33 @@ unsafe extern "C" fn report(
     bytes: *mut u8,
     len: isize,
 ) {
-    if result != 0 || bytes.is_null() || !(1..=128).contains(&len) {
+    if context.is_null() {
         return;
     }
     let rx = unsafe { &*context.cast::<Rx>() };
+    if result != 0 {
+        if rx.expected.get().is_some() {
+            rx.complete(Err(format!("HID input failed (0x{:08X})", result as u32)));
+        }
+        return;
+    }
+    if bytes.is_null() || !(1..=128).contains(&len) {
+        return;
+    }
     let data = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
-    if data[0] == report_id as u8 {
-        rx.packet(data);
-    } else if [0x10, 0x11].contains(&report_id) && data.len() < 20 {
-        let mut p = [0u8; 20];
-        p[0] = report_id as u8;
-        p[1..=data.len()].copy_from_slice(data);
-        rx.packet(&p[..data.len() + 1]);
+    if let Some(packet) = normalize_report(report_id, data) {
+        rx.packet(&packet.bytes[..packet.len]);
+    }
+}
+
+unsafe extern "C" fn device_removed(context: *mut c_void, _: i32, _: Ref) {
+    if context.is_null() {
+        return;
+    }
+    let rx = unsafe { &*context.cast::<Rx>() };
+    rx.disconnected.set(true);
+    if rx.expected.get().is_some() {
+        rx.complete(Err(DEVICE_DISCONNECTED.into()));
     }
 }
 #[derive(Clone, Copy)]
@@ -126,7 +226,7 @@ struct Capabilities {
     vertical: u8,
     horizontal: u8,
     controls: u8,
-    battery: u8,
+    battery: BatteryFeatures,
     dpi_values: Vec<u16>,
     current_dpi: u16,
     smart_state: [u8; 16],
@@ -135,14 +235,117 @@ struct Capabilities {
     buttons: Vec<Button>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BatteryFeatures {
+    unified: u8,
+    legacy: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatteryFeature {
+    Unified(u8),
+    Legacy(u8),
+}
+
+fn battery_feature_order(features: BatteryFeatures) -> [Option<BatteryFeature>; 2] {
+    [
+        (features.unified != 0).then_some(BatteryFeature::Unified(features.unified)),
+        (features.legacy != 0).then_some(BatteryFeature::Legacy(features.legacy)),
+    ]
+}
+
 /// Battery level read from the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatteryInfo {
-    /// Percentage (0–100), or 0 if unreadable.
+    /// Percentage (0–100). Zero is a valid reading.
     pub level_percent: u8,
-    /// true when the device is connected to a power source.
+    /// `true` while the device reports an active charging state.
     pub charging: bool,
 }
+
+fn parse_unified_battery(status: &[u8; 16]) -> Option<BatteryInfo> {
+    // 0x1004 getBatteryStatus directly returns percentage, level flags,
+    // charging state, and external-power state in bytes 0..=3. Some devices,
+    // including MX Master variants, do not advertise the separate capability
+    // bit consistently even though this status response contains a valid SOC.
+    if status[0] > 100 || status[2] > 7 {
+        return None;
+    }
+    Some(BatteryInfo {
+        level_percent: status[0],
+        charging: matches!(status[2], 1 | 2 | 4),
+    })
+}
+
+fn parse_legacy_battery(status: &[u8; 16]) -> Option<BatteryInfo> {
+    // 0x1000 getBatteryLevelStatus returns percentage, next percentage, and
+    // charging state in bytes 0..=2. Values 1, 2, and 4 are charging states.
+    if status[0] > 100 || status[2] > 7 {
+        return None;
+    }
+    Some(BatteryInfo {
+        level_percent: status[0],
+        charging: matches!(status[2], 1 | 2 | 4),
+    })
+}
+
+const DEVICE_DISCONNECTED: &str = "Mouse disconnected. Reconnect it before applying settings.";
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(450);
+const REQUEST_WAIT_SLICE: Duration = Duration::from_millis(20);
+const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestInterruption {
+    Stopped,
+    Disconnected,
+}
+
+impl RequestInterruption {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Stopped => "Hardware session stopped",
+            Self::Disconnected => DEVICE_DISCONNECTED,
+        }
+    }
+}
+
+fn request_interruption(
+    stopped: bool,
+    disconnected: bool,
+    allow_stopped: bool,
+) -> Option<RequestInterruption> {
+    if disconnected {
+        Some(RequestInterruption::Disconnected)
+    } else if stopped && !allow_stopped {
+        Some(RequestInterruption::Stopped)
+    } else {
+        None
+    }
+}
+
+fn smart_shift_update(feature: u8, wheel_mode: u8, threshold: u8) -> Option<(u8, [u8; 3])> {
+    (feature != 0).then_some((feature, [wheel_mode, threshold, 0]))
+}
+
+fn settings_uses_wheel_toggle(settings: &Settings) -> bool {
+    (settings.horizontal
+        && settings
+            .horizontal_actions
+            .iter()
+            .any(|action| action.kind == 5))
+        || settings
+            .bindings
+            .iter()
+            .filter(|binding| binding.enabled)
+            .any(|binding| {
+                if binding.gesture {
+                    binding.actions.iter().any(|action| action.kind == 5)
+                } else {
+                    binding.actions[0].kind == 5
+                }
+            })
+}
+
 pub struct Session {
     device: Owned,
     _manager: Owned,
@@ -150,18 +353,27 @@ pub struct Session {
     buffer: Box<[u8; 128]>,
     sequence: Cell<u8>,
     caps: Option<Capabilities>,
+    battery: Option<BatteryInfo>,
     changed: bool,
+    control: Arc<Mutex<HardwareControl>>,
 }
 impl Session {
     fn open(
         id: u64,
         output: Option<OutputCallback>,
         context: usize,
-        _control: Arc<Mutex<HardwareControl>>,
+        control: Arc<Mutex<HardwareControl>>,
     ) -> Result<Self, String> {
         let manager = manager()?;
-        let device=interfaces(manager.0).into_iter().find(|(_,d)|d.registry_id==id && d.transport.contains("Bluetooth"))
-            .map(|(p,_)|p as Ref).ok_or("Selected Bluetooth device is no longer connected. Receiver settings are not supported yet.")?;
+        let (device, battery_level) = interfaces(manager.0)
+            .into_iter()
+            .find(|(_, record)| {
+                record.registry_id == id && record.transport.contains("Bluetooth")
+            })
+            .map(|(device, record)| (device as Ref, record.battery_level))
+            .ok_or(
+                "Selected Bluetooth device is no longer connected. Receiver settings are not supported yet.",
+            )?;
         let device = Owned(unsafe { CFRetain(device) });
         let status = unsafe { IOHIDDeviceOpen(device.0, 0) };
         if status != 0 {
@@ -176,12 +388,16 @@ impl Session {
             controls: Cell::new(0),
             vertical: Cell::new(0),
             horizontal: Cell::new(0),
+            battery_unified: Cell::new(0),
+            battery_legacy: Cell::new(0),
+            battery_update: Cell::new(None),
             vertical_multiplier: Cell::new(1.0),
             horizontal_multiplier: Cell::new(1.0),
             engine: RefCell::new(InputEngine::default()),
             output,
             context,
             toggle: Cell::new(false),
+            disconnected: Cell::new(false),
         });
         let mut result = Self {
             device,
@@ -190,16 +406,23 @@ impl Session {
             buffer: Box::new([0; 128]),
             sequence: Cell::new(0),
             caps: None,
+            battery: battery_level.map(|level_percent| BatteryInfo {
+                level_percent,
+                charging: false,
+            }),
             changed: false,
+            control,
         };
         unsafe {
+            let rx_context = (&*result.rx as *const Rx).cast_mut().cast();
             IOHIDDeviceRegisterInputReportCallback(
                 result.device.0,
                 result.buffer.as_mut_ptr(),
                 128,
                 Some(report),
-                (&*result.rx as *const Rx).cast_mut().cast(),
+                rx_context,
             );
+            IOHIDDeviceRegisterRemovalCallback(result.device.0, Some(device_removed), rx_context);
             IOHIDDeviceScheduleWithRunLoop(
                 result.device.0,
                 CFRunLoopGetCurrent(),
@@ -209,35 +432,61 @@ impl Session {
         Ok(result)
     }
     fn request(&self, feature: u8, function: u8, parameters: &[u8]) -> Result<[u8; 16], String> {
-        if parameters.len() > 16 {
-            return Err("HID++ request too large".into());
+        self.request_with_stop_policy(feature, function, parameters, false)
+    }
+    fn request_during_shutdown(
+        &self,
+        feature: u8,
+        function: u8,
+        parameters: &[u8],
+    ) -> Result<[u8; 16], String> {
+        self.request_with_stop_policy(feature, function, parameters, true)
+    }
+    fn interruption(&self, allow_stopped: bool) -> Option<RequestInterruption> {
+        let stopped = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stopped;
+        request_interruption(stopped, self.rx.disconnected.get(), allow_stopped)
+    }
+    fn request_with_stop_policy(
+        &self,
+        feature: u8,
+        function: u8,
+        parameters: &[u8],
+        allow_stopped: bool,
+    ) -> Result<[u8; 16], String> {
+        if let Some(interruption) = self.interruption(allow_stopped) {
+            return Err(interruption.message().into());
         }
         let sequence = (self.sequence.get() % 15) + 1;
+        let packet = encode_request(feature, function, sequence, parameters)?;
         self.sequence.set(sequence);
-        let function = (function << 4) | sequence;
-        let mut packet = Packet {
-            bytes: [0; 20],
-            len: 20,
-        };
-        packet.bytes[..4].copy_from_slice(&[0x11, 0xff, feature, function]);
-        packet.bytes[4..4 + parameters.len()].copy_from_slice(parameters);
-        self.rx.expected.set(Some((feature, function)));
+        let correlated_function = packet.bytes[3];
+        self.rx.expected.set(Some((feature, correlated_function)));
         self.rx.response.borrow_mut().take();
         let status = unsafe {
             IOHIDDeviceSetReport(
                 self.device.0,
                 1,
-                0x11,
+                HIDPP_LONG_REPORT as isize,
                 packet.bytes.as_ptr(),
                 packet.len as isize,
             )
         };
         if status != 0 {
             self.rx.expected.set(None);
+            if let Some(interruption) = self.interruption(allow_stopped) {
+                return Err(interruption.message().into());
+            }
             return Err(format!("HID write failed (0x{:08X})", status as u32));
         }
-        let deadline = Instant::now() + Duration::from_millis(450);
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
         let result = loop {
+            if let Some(interruption) = self.interruption(allow_stopped) {
+                break Err(interruption.message().into());
+            }
             if let Some(reply) = self.rx.response.borrow_mut().take() {
                 break reply;
             }
@@ -245,11 +494,12 @@ impl Session {
             if remaining.is_zero() {
                 break Err(format!(
                     "Mouse did not answer feature {feature:02X}, function {:X}",
-                    function >> 4
+                    correlated_function >> 4
                 ));
             }
+            let wait = remaining.min(REQUEST_WAIT_SLICE);
             unsafe {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), 1);
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait.as_secs_f64(), 1);
             }
         };
         self.rx.expected.set(None);
@@ -258,13 +508,27 @@ impl Session {
     fn feature(&self, id: u16) -> Result<u8, String> {
         Ok(self.request(0, 0, &id.to_be_bytes())?[0])
     }
+    fn initialize_battery(&mut self) -> BatteryFeatures {
+        let features = BatteryFeatures {
+            unified: self.feature(0x1004).unwrap_or(0),
+            legacy: self.feature(0x1000).unwrap_or(0),
+        };
+        self.rx.battery_unified.set(features.unified);
+        self.rx.battery_legacy.set(features.legacy);
+        if let Some(battery) = self.read_battery_features(features) {
+            self.battery = Some(battery);
+        }
+        features
+    }
     fn probe(&mut self) -> Result<(), String> {
+        // Read battery first so it remains available even if an unrelated
+        // customization feature cannot be probed on this device.
+        let battery = self.initialize_battery();
         let dpi = self.feature(0x2201)?;
         let smart = self.feature(0x2110)?;
         let vertical = self.feature(0x2121)?;
         let horizontal = self.feature(0x2150)?;
         let controls = self.feature(0x1b04)?;
-        let battery = self.feature(0x0015)?;
         let mut caps = Capabilities {
             dpi,
             smart,
@@ -322,28 +586,84 @@ impl Session {
         self.rx.vertical.set(vertical);
         self.rx.horizontal.set(horizontal);
         self.caps = Some(caps);
+        if let Some(interruption) = self.interruption(false) {
+            return Err(interruption.message().into());
+        }
         Ok(())
     }
     /// Read battery level and charging status from the device.
     pub fn read_battery(&self) -> Option<BatteryInfo> {
-        let c = self.caps.as_ref()?;
-        if c.battery == 0 {
-            return None;
+        let features = self.caps.as_ref()?.battery;
+        self.read_battery_features(features)
+    }
+    fn read_battery_features(&self, features: BatteryFeatures) -> Option<BatteryInfo> {
+        for feature in battery_feature_order(features).into_iter().flatten() {
+            let battery =
+                match feature {
+                    BatteryFeature::Unified(index) => self
+                        .request(index, 1, &[])
+                        .ok()
+                        .as_ref()
+                        .and_then(parse_unified_battery),
+                    BatteryFeature::Legacy(index) => self
+                        .request(index, 0, &[])
+                        .ok()
+                        .as_ref()
+                        .and_then(parse_legacy_battery),
+                };
+            if battery.is_some() {
+                return battery;
+            }
         }
-        let p = self.request(c.battery, 0, &[]).ok()?;
-        // HID++ Battery feature (0x0015): byte[0] = level (0-100), byte[1] = status flags
-        // Status: bit 0 = 1 when charging
-        let level_percent = p[0];
-        let charging = p[1] & 0x01 != 0;
-        Some(BatteryInfo {
-            level_percent,
-            charging,
-        })
+        optional_number(self.device.0, "BatteryLevel")
+            .and_then(valid_battery_level)
+            .map(|level_percent| BatteryInfo {
+                level_percent,
+                charging: false,
+            })
+    }
+    fn refresh_battery(&mut self) -> bool {
+        let Some(battery) = self.read_battery() else {
+            return false;
+        };
+        if self.battery == Some(battery) {
+            return false;
+        }
+        self.battery = Some(battery);
+        true
+    }
+    fn take_battery_update(&mut self) -> bool {
+        let Some(battery) = self.rx.battery_update.take() else {
+            return false;
+        };
+        if self.battery == Some(battery) {
+            return false;
+        }
+        self.battery = Some(battery);
+        true
+    }
+    fn disconnected(&self) -> bool {
+        self.rx.disconnected.get()
+    }
+    fn disconnected_snapshot(&self) -> String {
+        format!(
+            "{{\"ready\":false,\"applied\":false,\"battery\":{},\"error\":{}}}",
+            self.battery_json(),
+            json_string(DEVICE_DISCONNECTED)
+        )
+    }
+    fn unavailable_snapshot(&self, error: &str) -> String {
+        format!(
+            "{{\"ready\":false,\"applied\":false,\"battery\":{},\"error\":{}}}",
+            self.battery_json(),
+            json_string(error)
+        )
     }
     fn snapshot(&self, applied: bool, error: Option<&str>) -> String {
+        let battery = self.battery_json();
         let Some(c) = &self.caps else {
             return format!(
-                "{{\"ready\":false,\"applied\":false,\"error\":{}}}",
+                "{{\"ready\":false,\"applied\":false,\"battery\":{battery},\"error\":{}}}",
                 error.map(json_string).unwrap_or("null".into())
             );
         };
@@ -361,7 +681,7 @@ impl Session {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"ready\":true,\"applied\":{applied},\"dpi_values\":{:?},\"dpi\":{},\"smart_shift\":{},\"wheel_mode\":{},\"threshold\":{},\"vertical\":{},\"horizontal\":{},\"buttons\":[{}],\"error\":{}}}",
+            "{{\"ready\":true,\"applied\":{applied},\"dpi_values\":{:?},\"dpi\":{},\"smart_shift\":{},\"wheel_mode\":{},\"threshold\":{},\"vertical\":{},\"horizontal\":{},\"buttons\":[{}],\"battery\":{battery},\"error\":{}}}",
             c.dpi_values,
             c.current_dpi,
             c.smart != 0,
@@ -373,21 +693,18 @@ impl Session {
             error.map(json_string).unwrap_or("null".into())
         )
     }
+    fn battery_json(&self) -> String {
+        match self.battery {
+            Some(battery) => format!(
+                "{{\"level_percent\":{},\"charging\":{}}}",
+                battery.level_percent, battery.charging
+            ),
+            None => "null".into(),
+        }
+    }
     /// Return battery snapshot as JSON string.
     pub fn battery_snapshot(&self) -> String {
-        let Some(c) = &self.caps else {
-            return "{\"battery\":null}".to_string();
-        };
-        if c.battery == 0 {
-            return "{\"battery\":null}".to_string();
-        }
-        match self.read_battery() {
-            Some(bat) => format!(
-                "{{\"battery\":{{\"level_percent\":{},\"charging\":{}}}}}",
-                bat.level_percent, bat.charging
-            ),
-            None => "{\"battery\":null}".to_string(),
-        }
+        format!("{{\"battery\":{}}}", self.battery_json())
     }
     fn apply(&mut self, settings: Settings) -> Result<(), String> {
         let c = self.caps.as_ref().ok_or("Capabilities not available")?;
@@ -397,8 +714,8 @@ impl Session {
         if settings.vertical && c.vertical == 0 || settings.horizontal && c.horizontal == 0 {
             return Err("This mouse lacks the required wheel feature".into());
         }
-        if c.smart == 0 {
-            return Err("This mouse lacks the supported SmartShift feature".into());
+        if c.smart == 0 && settings_uses_wheel_toggle(&settings) {
+            return Err("This mouse cannot run a binding that toggles SmartShift".into());
         }
         for (i, binding) in settings.bindings.iter().enumerate() {
             if binding.enabled {
@@ -435,10 +752,14 @@ impl Session {
                     return Err("DPI readback did not match".into());
                 }
             }
-            self.request(c.smart, 1, &[settings.wheel_mode, settings.threshold, 0])?;
-            let actual = self.request(c.smart, 0, &[])?;
-            if actual[0] != settings.wheel_mode || actual[1] != settings.threshold {
-                return Err("Wheel mode readback did not match".into());
+            if let Some((feature, parameters)) =
+                smart_shift_update(c.smart, settings.wheel_mode, settings.threshold)
+            {
+                self.request(feature, 1, &parameters)?;
+                let actual = self.request(feature, 0, &[])?;
+                if actual[0] != settings.wheel_mode || actual[1] != settings.threshold {
+                    return Err("Wheel mode readback did not match".into());
+                }
             }
             if c.vertical != 0 {
                 let mode = if settings.vertical {
@@ -496,46 +817,103 @@ impl Session {
         result
     }
     fn restore(&mut self) -> Result<(), String> {
+        self.restore_with_stop_policy(false)
+    }
+    fn restore_during_shutdown(&mut self) -> Result<(), String> {
+        self.restore_with_stop_policy(true)
+    }
+    fn restore_request(
+        &self,
+        feature: u8,
+        function: u8,
+        parameters: &[u8],
+        allow_stopped: bool,
+    ) -> Result<[u8; 16], String> {
+        if allow_stopped {
+            self.request_during_shutdown(feature, function, parameters)
+        } else {
+            self.request(feature, function, parameters)
+        }
+    }
+    fn restore_with_stop_policy(&mut self, allow_stopped: bool) -> Result<(), String> {
+        self.rx
+            .engine
+            .borrow_mut()
+            .release_all(|event| self.rx.emit(event));
+        self.rx.engine.borrow_mut().settings = None;
         if !self.changed {
             return Ok(());
         }
+        if let Some(interruption) = self.interruption(allow_stopped) {
+            if interruption == RequestInterruption::Disconnected {
+                self.changed = false;
+                return Ok(());
+            }
+            return Err(interruption.message().into());
+        }
         let c = self.caps.as_ref().ok_or("No restore snapshot")?;
         let mut errors = vec![];
+        // A user-requested pause can try every independent restore. During
+        // shutdown, bound the join delay: one failed request is enough to show
+        // that the transport is not responding, so do not wait on every field.
+        let mut abort_writes = false;
         for b in &c.buttons {
             if b.flags & 0x30 == 0x30 {
                 let cid = b.id.to_be_bytes();
-                if let Err(e) = self.request(
+                if let Err(e) = self.restore_request(
                     c.controls,
                     3,
                     &[cid[0], cid[1], 0x22 | (b.reporting[2] & 0x11), 0, 0],
+                    allow_stopped,
                 ) {
                     errors.push(e);
+                    abort_writes = allow_stopped;
+                }
+                if abort_writes || self.interruption(allow_stopped).is_some() {
+                    break;
                 }
             }
         }
-        if c.vertical != 0
-            && let Err(e) = self.request(c.vertical, 2, &[c.vertical_state])
+        if !abort_writes
+            && self.interruption(allow_stopped).is_none()
+            && c.vertical != 0
+            && let Err(e) = self.restore_request(c.vertical, 2, &[c.vertical_state], allow_stopped)
         {
             errors.push(e);
+            abort_writes = allow_stopped;
         }
-        if c.horizontal != 0
-            && let Err(e) = self.request(c.horizontal, 2, &c.horizontal_state)
+        if !abort_writes
+            && self.interruption(allow_stopped).is_none()
+            && c.horizontal != 0
+            && let Err(e) =
+                self.restore_request(c.horizontal, 2, &c.horizontal_state, allow_stopped)
         {
             errors.push(e);
+            abort_writes = allow_stopped;
         }
-        if c.smart != 0
-            && let Err(e) = self.request(c.smart, 1, &[c.smart_state[0], c.smart_state[1], 0])
+        if !abort_writes
+            && self.interruption(allow_stopped).is_none()
+            && c.smart != 0
+            && let Err(e) = self.restore_request(
+                c.smart,
+                1,
+                &[c.smart_state[0], c.smart_state[1], 0],
+                allow_stopped,
+            )
         {
             errors.push(e);
+            abort_writes = allow_stopped;
         }
-        if c.dpi != 0 {
+        if !abort_writes && self.interruption(allow_stopped).is_none() && c.dpi != 0 {
             let d = c.current_dpi.to_be_bytes();
-            if let Err(e) = self.request(c.dpi, 3, &[0, d[0], d[1]]) {
+            if let Err(e) = self.restore_request(c.dpi, 3, &[0, d[0], d[1]], allow_stopped) {
                 errors.push(e);
             }
         }
-        self.rx.engine.borrow_mut().release_all(|e| self.rx.emit(e));
-        self.rx.engine.borrow_mut().settings = None;
+        if self.rx.disconnected.get() {
+            self.changed = false;
+            return Ok(());
+        }
         self.changed = !errors.is_empty();
         if errors.is_empty() {
             Ok(())
@@ -547,17 +925,18 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         unsafe {
+            IOHIDDeviceRegisterRemovalCallback(self.device.0, None, ptr::null_mut());
+            IOHIDDeviceRegisterInputReportCallback(
+                self.device.0,
+                self.buffer.as_mut_ptr(),
+                self.buffer.len() as isize,
+                None,
+                ptr::null_mut(),
+            );
             IOHIDDeviceUnscheduleFromRunLoop(
                 self.device.0,
                 CFRunLoopGetCurrent(),
                 kCFRunLoopDefaultMode,
-            );
-            IOHIDDeviceRegisterInputReportCallback(
-                self.device.0,
-                ptr::null_mut(),
-                0,
-                None,
-                ptr::null_mut(),
             );
             IOHIDDeviceClose(self.device.0, 0);
         }
@@ -602,7 +981,7 @@ pub fn battery(id: u64) -> Result<String, String> {
         0,
         Arc::new(Mutex::new(HardwareControl::default())),
     )?;
-    s.probe()?;
+    s.initialize_battery();
     Ok(s.battery_snapshot())
 }
 
@@ -613,11 +992,83 @@ struct HardwareControl {
     source: usize,
     pending: Option<Option<Settings>>,
 }
+impl Drop for HardwareControl {
+    fn drop(&mut self) {
+        unsafe {
+            if self.source != 0 {
+                CFRelease(self.source as Ref);
+            }
+            if self.runloop != 0 {
+                CFRelease(self.runloop as Ref);
+            }
+        }
+    }
+}
 pub struct HardwareHandle {
     control: Arc<Mutex<HardwareControl>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 unsafe extern "C" fn wake(_: *mut c_void) {}
+fn control_stopped(control: &Arc<Mutex<HardwareControl>>) -> bool {
+    control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .stopped
+}
+
+fn stop_control(control: &Arc<Mutex<HardwareControl>>) {
+    let mut state = control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.stopped = true;
+    state.pending = None;
+}
+
+fn clear_signal_refs(control: &Arc<Mutex<HardwareControl>>) {
+    let (runloop, source) = {
+        let mut state = control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let refs = (state.runloop, state.source);
+        state.runloop = 0;
+        state.source = 0;
+        refs
+    };
+    unsafe {
+        if source != 0 {
+            CFRelease(source as Ref);
+        }
+        if runloop != 0 {
+            CFRelease(runloop as Ref);
+        }
+    }
+}
+
+fn take_disconnect_notification(disconnected: bool, reported: &mut bool) -> bool {
+    if !disconnected || *reported {
+        return false;
+    }
+    *reported = true;
+    true
+}
+
+fn stop_if_disconnected(
+    session: &Session,
+    control: &Arc<Mutex<HardwareControl>>,
+    callback: SnapshotCallback,
+    context: usize,
+    reported: &mut bool,
+) -> bool {
+    if !session.disconnected() {
+        return false;
+    }
+    stop_control(control);
+    if take_disconnect_notification(true, reported) {
+        emit(callback, context, &session.disconnected_snapshot());
+    }
+    true
+}
+
 fn hardware_run(
     id: u64,
     control: Arc<Mutex<HardwareControl>>,
@@ -625,27 +1076,50 @@ fn hardware_run(
     output: OutputCallback,
     context: usize,
 ) {
+    if control_stopped(&control) {
+        return;
+    }
     let mut session = match Session::open(id, Some(output), context, Arc::clone(&control)) {
         Ok(mut s) => {
+            if s.interruption(false) == Some(RequestInterruption::Stopped) {
+                return;
+            }
             if let Err(e) = s.probe() {
-                emit(callback, context, &s.snapshot(false, Some(&e)));
+                let stopped = s.interruption(false) == Some(RequestInterruption::Stopped);
+                stop_control(&control);
+                if s.disconnected() {
+                    emit(callback, context, &s.disconnected_snapshot());
+                } else if !stopped {
+                    emit(callback, context, &s.snapshot(false, Some(&e)));
+                }
                 return;
             }
             s
         }
         Err(e) => {
-            emit(
-                callback,
-                context,
-                &format!(
-                    "{{\"ready\":false,\"applied\":false,\"error\":{}}}",
-                    json_string(&e)
-                ),
-            );
+            let should_emit = !control_stopped(&control);
+            stop_control(&control);
+            if should_emit {
+                emit(
+                    callback,
+                    context,
+                    &format!(
+                        "{{\"ready\":false,\"applied\":false,\"battery\":null,\"error\":{}}}",
+                        json_string(&e)
+                    ),
+                );
+            }
             return;
         }
     };
-    emit(callback, context, &session.snapshot(false, None));
+    if session.disconnected() {
+        stop_control(&control);
+        emit(callback, context, &session.disconnected_snapshot());
+        return;
+    }
+    if control_stopped(&control) {
+        return;
+    }
     unsafe {
         let runloop = CFRunLoopGetCurrent();
         let mut ctx = SourceContext {
@@ -662,19 +1136,34 @@ fn hardware_run(
         };
         let source = Owned(CFRunLoopSourceCreate(ptr::null(), 0, &mut ctx));
         if source.0.is_null() {
+            stop_control(&control);
             emit(
                 callback,
                 context,
-                &session.snapshot(false, Some("Cannot create settings control source")),
+                &session.unavailable_snapshot("Cannot create settings control source"),
             );
             return;
         }
         CFRunLoopAddSource(runloop, source.0, kCFRunLoopDefaultMode);
+        // HardwareControl keeps independent references. A signaling caller
+        // takes its own retains while holding the mutex, so cleanup can clear
+        // and release these references without a use-after-free race.
+        let retained_runloop = CFRetain(runloop);
+        let retained_source = CFRetain(source.0);
         {
             let mut c = control.lock().unwrap_or_else(|p| p.into_inner());
-            c.runloop = runloop as usize;
-            c.source = source.0 as usize;
+            c.runloop = retained_runloop as usize;
+            c.source = retained_source as usize;
         }
+        if control_stopped(&control) {
+            CFRunLoopRemoveSource(runloop, source.0, kCFRunLoopDefaultMode);
+            clear_signal_refs(&control);
+            return;
+        }
+        emit(callback, context, &session.snapshot(false, None));
+        let mut applied = false;
+        let mut disconnected_reported = false;
+        let mut next_battery_refresh = Instant::now() + BATTERY_REFRESH_INTERVAL;
         loop {
             let (stopped, pending) = {
                 let mut c = control.lock().unwrap_or_else(|p| p.into_inner());
@@ -683,20 +1172,39 @@ fn hardware_run(
             if stopped {
                 break;
             }
+            if stop_if_disconnected(
+                &session,
+                &control,
+                callback,
+                context,
+                &mut disconnected_reported,
+            ) {
+                break;
+            }
             if let Some(settings) = pending {
-                let applied = settings.is_some();
+                let requested_applied = settings.is_some();
                 let result = if let Some(s) = settings {
                     session.apply(s)
                 } else {
                     session.restore()
                 };
+                if stop_if_disconnected(
+                    &session,
+                    &control,
+                    callback,
+                    context,
+                    &mut disconnected_reported,
+                ) {
+                    break;
+                }
+                if control_stopped(&control) {
+                    break;
+                }
+                applied = requested_applied && result.is_ok();
                 emit(
                     callback,
                     context,
-                    &session.snapshot(
-                        applied && result.is_ok(),
-                        result.as_ref().err().map(String::as_str),
-                    ),
+                    &session.snapshot(applied, result.as_ref().err().map(String::as_str)),
                 );
             }
             if session.rx.toggle.replace(false)
@@ -707,18 +1215,56 @@ fn hardware_run(
                     session.request(c.smart, 1, &[if p[0] == 1 { 2 } else { 1 }, 0, 0])
                 });
                 if let Err(e) = result {
-                    emit(
+                    if stop_if_disconnected(
+                        &session,
+                        &control,
                         callback,
                         context,
-                        &session.snapshot(session.changed, Some(&e)),
-                    );
+                        &mut disconnected_reported,
+                    ) {
+                        break;
+                    }
+                    if control_stopped(&control) {
+                        break;
+                    }
+                    emit(callback, context, &session.snapshot(applied, Some(&e)));
                 }
             }
-            // Source is persistent: a signal before the wait is not lost.
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0e9, 1);
+            if session.take_battery_update() {
+                emit(callback, context, &session.snapshot(applied, None));
+            }
+            if Instant::now() >= next_battery_refresh {
+                next_battery_refresh = Instant::now() + BATTERY_REFRESH_INTERVAL;
+                if session.refresh_battery() {
+                    emit(callback, context, &session.snapshot(applied, None));
+                }
+                if stop_if_disconnected(
+                    &session,
+                    &control,
+                    callback,
+                    context,
+                    &mut disconnected_reported,
+                ) {
+                    break;
+                }
+            }
+            // Input and control sources wake this wait immediately. The bounded
+            // timeout also refreshes the displayed battery while the app runs.
+            let wait = next_battery_refresh
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait.as_secs_f64(), 1);
         }
-        let result = session.restore();
-        if let Err(e) = result {
+        stop_control(&control);
+        let result = session.restore_during_shutdown();
+        if !stop_if_disconnected(
+            &session,
+            &control,
+            callback,
+            context,
+            &mut disconnected_reported,
+        ) && let Err(e) = result
+        {
             emit(
                 callback,
                 context,
@@ -728,12 +1274,8 @@ fn hardware_run(
                 ),
             );
         }
-        {
-            let mut c = control.lock().unwrap_or_else(|p| p.into_inner());
-            c.runloop = 0;
-            c.source = 0;
-        }
         CFRunLoopRemoveSource(runloop, source.0, kCFRunLoopDefaultMode);
+        clear_signal_refs(&control);
     }
 }
 /// # Safety
@@ -759,12 +1301,21 @@ pub unsafe extern "C" fn smoothmx_hardware_start(
         Err(_) => ptr::null_mut(),
     }
 }
-fn signal(c: &HardwareControl) {
-    if c.source != 0 {
-        unsafe {
-            CFRunLoopSourceSignal(c.source as Ref);
-            CFRunLoopWakeUp(c.runloop as Ref);
+fn signal(control: &Arc<Mutex<HardwareControl>>) {
+    let (runloop, source) = {
+        let c = control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if c.runloop == 0 || c.source == 0 {
+            return;
         }
+        unsafe { (CFRetain(c.runloop as Ref), CFRetain(c.source as Ref)) }
+    };
+    unsafe {
+        CFRunLoopSourceSignal(source);
+        CFRunLoopWakeUp(runloop);
+        CFRelease(source);
+        CFRelease(runloop);
     }
 }
 /// # Safety
@@ -790,12 +1341,14 @@ pub unsafe extern "C" fn smoothmx_hardware_apply(
         }
     };
     let h = unsafe { &*handle };
-    let mut c = h.control.lock().unwrap_or_else(|p| p.into_inner());
-    if c.stopped {
-        return -1;
+    {
+        let mut c = h.control.lock().unwrap_or_else(|p| p.into_inner());
+        if c.stopped {
+            return -1;
+        }
+        c.pending = Some(settings);
     }
-    c.pending = Some(settings);
-    signal(&c);
+    signal(&h.control);
     0
 }
 /// # Safety
@@ -809,8 +1362,8 @@ pub unsafe extern "C" fn smoothmx_hardware_stop(handle: *mut HardwareHandle) {
     {
         let mut c = h.control.lock().unwrap_or_else(|p| p.into_inner());
         c.stopped = true;
-        signal(&c);
     }
+    signal(&h.control);
     if let Some(worker) = h.worker.take() {
         let _ = worker.join();
     }
@@ -833,7 +1386,7 @@ pub unsafe extern "C" fn smoothmx_hardware_battery_read(registry_id: u64) -> *mu
             0,
             Arc::new(Mutex::new(HardwareControl::default())),
         )?;
-        s.probe()?;
+        s.initialize_battery();
         Ok(s.battery_snapshot())
     })();
     match json {
@@ -860,6 +1413,131 @@ pub unsafe extern "C" fn smoothmx_hardware_free(ptr: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smoothmx_core::input::{Action, Binding};
+
+    fn settings() -> Settings {
+        Settings {
+            dpi: 0,
+            wheel_mode: 1,
+            threshold: 16,
+            vertical: false,
+            vertical_gain: 1.0,
+            vertical_invert: false,
+            smooth: false,
+            horizontal: false,
+            horizontal_gain: 1.0,
+            horizontal_invert: false,
+            horizontal_actions: [Action::default(); 2],
+            gesture_threshold: 80,
+            bindings: [Binding::default(); 5],
+        }
+    }
+
+    fn rx() -> Rx {
+        Rx {
+            expected: Cell::new(None),
+            response: RefCell::new(None),
+            controls: Cell::new(0),
+            vertical: Cell::new(0),
+            horizontal: Cell::new(0),
+            battery_unified: Cell::new(0),
+            battery_legacy: Cell::new(0),
+            battery_update: Cell::new(None),
+            vertical_multiplier: Cell::new(1.0),
+            horizontal_multiplier: Cell::new(1.0),
+            engine: RefCell::new(InputEngine::default()),
+            output: None,
+            context: 0,
+            toggle: Cell::new(false),
+            disconnected: Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn normalizes_only_complete_hidpp_reports() {
+        let mut long = [0u8; HIDPP_LONG_LENGTH];
+        long[..4].copy_from_slice(&[HIDPP_LONG_REPORT, 0xff, 3, 0x21]);
+        let packet = normalize_report(HIDPP_LONG_REPORT.into(), &long).unwrap();
+        assert_eq!(&packet.bytes[..packet.len], &long);
+
+        let packet = normalize_report(HIDPP_LONG_REPORT.into(), &long[1..]).unwrap();
+        assert_eq!(&packet.bytes[..packet.len], &long);
+        assert!(normalize_report(HIDPP_LONG_REPORT.into(), &long[..18]).is_none());
+        assert!(normalize_report(HIDPP_SHORT_REPORT.into(), &long[..8]).is_none());
+        assert!(normalize_report(0x110, &long).is_none());
+    }
+
+    #[test]
+    fn encodes_and_bounds_hidpp_requests() {
+        let packet = encode_request(3, 2, 15, &[1, 2, 3]).unwrap();
+        assert_eq!(&packet.bytes[..7], &[0x11, 0xff, 3, 0x2f, 1, 2, 3]);
+        assert!(encode_request(3, 16, 1, &[]).is_err());
+        assert!(encode_request(3, 2, 0, &[]).is_err());
+        assert!(encode_request(3, 2, 1, &[0; 17]).is_err());
+    }
+
+    #[test]
+    fn correlates_success_and_error_without_overwriting_first_response() {
+        let rx = rx();
+        rx.expected.set(Some((3, 0x21)));
+        rx.packet(&[0x10, 0xff, 0xff, 3, 0x21, 8, 0]);
+        rx.packet(&[0x10, 0xff, 3, 0x21, 7, 8, 9]);
+        assert_eq!(
+            rx.response.borrow().as_ref().unwrap().as_ref().unwrap_err(),
+            "HID++ error 0x08"
+        );
+
+        rx.response.borrow_mut().take();
+        rx.packet(&[0x10, 0xff, 3, 0x21, 7, 8, 9]);
+        let response = *rx.response.borrow().as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(&response[..3], &[7, 8, 9]);
+    }
+
+    #[test]
+    fn shutdown_allows_restore_but_disconnect_always_interrupts() {
+        assert_eq!(
+            request_interruption(true, false, false),
+            Some(RequestInterruption::Stopped)
+        );
+        assert_eq!(request_interruption(true, false, true), None);
+        assert_eq!(
+            request_interruption(true, true, true),
+            Some(RequestInterruption::Disconnected)
+        );
+    }
+
+    #[test]
+    fn disconnect_notification_is_taken_only_once() {
+        let mut reported = false;
+        assert!(!take_disconnect_notification(false, &mut reported));
+        assert!(take_disconnect_notification(true, &mut reported));
+        assert!(!take_disconnect_notification(true, &mut reported));
+    }
+
+    #[test]
+    fn wheel_toggle_requires_smart_shift_only_when_action_is_reachable() {
+        let mut settings = settings();
+        settings.bindings[0].actions[0].kind = 5;
+        assert!(!settings_uses_wheel_toggle(&settings));
+
+        settings.bindings[0].enabled = true;
+        assert!(settings_uses_wheel_toggle(&settings));
+
+        settings.bindings[0] = Binding::default();
+        settings.horizontal_actions[1].kind = 5;
+        assert!(!settings_uses_wheel_toggle(&settings));
+        settings.horizontal = true;
+        assert!(settings_uses_wheel_toggle(&settings));
+
+        settings.horizontal = false;
+        settings.horizontal_actions = [Action::default(); 2];
+        settings.bindings[0].enabled = true;
+        settings.bindings[0].actions[4].kind = 5;
+        assert!(!settings_uses_wheel_toggle(&settings));
+        settings.bindings[0].gesture = true;
+        assert!(settings_uses_wheel_toggle(&settings));
+    }
+
     #[test]
     fn dpi_range() {
         let mut p = [0; 16];
@@ -875,12 +1553,74 @@ mod tests {
         assert!(decode_dpi(&p).is_err());
     }
     #[test]
-    fn battery_info_struct_clippy() {
-        let bat = BatteryInfo {
-            level_percent: 75,
-            charging: true,
-        };
-        assert_eq!(bat.level_percent, 75);
-        assert!(bat.charging);
+    fn unified_battery_preserves_zero_percent_and_charging_state() {
+        let mut status = [0; 16];
+        status[0] = 0;
+        status[2] = 4;
+        assert_eq!(
+            parse_unified_battery(&status),
+            Some(BatteryInfo {
+                level_percent: 0,
+                charging: true,
+            })
+        );
+    }
+    #[test]
+    fn battery_parsers_reject_invalid_percentages() {
+        let mut status = [0; 16];
+        status[0] = 101;
+        assert_eq!(parse_unified_battery(&status), None);
+        assert_eq!(parse_legacy_battery(&status), None);
+
+        status[0] = 50;
+        status[2] = 8;
+        assert_eq!(parse_unified_battery(&status), None);
+        assert_eq!(parse_legacy_battery(&status), None);
+    }
+    #[test]
+    fn legacy_battery_decodes_charging_status() {
+        let mut status = [0; 16];
+        status[0] = 75;
+        status[2] = 4;
+        assert_eq!(
+            parse_legacy_battery(&status),
+            Some(BatteryInfo {
+                level_percent: 75,
+                charging: true,
+            })
+        );
+    }
+    #[test]
+    fn battery_features_prefer_unified_then_fall_back_to_legacy() {
+        assert_eq!(
+            battery_feature_order(BatteryFeatures {
+                unified: 3,
+                legacy: 7,
+            }),
+            [
+                Some(BatteryFeature::Unified(3)),
+                Some(BatteryFeature::Legacy(7)),
+            ]
+        );
+        assert_eq!(
+            battery_feature_order(BatteryFeatures {
+                unified: 0,
+                legacy: 7,
+            }),
+            [None, Some(BatteryFeature::Legacy(7))]
+        );
+    }
+    #[test]
+    fn unified_battery_event_queues_live_update() {
+        let rx = rx();
+        rx.battery_unified.set(3);
+        rx.packet(&[HIDPP_SHORT_REPORT, 0xff, 3, 0, 64, 4, 1]);
+        assert_eq!(
+            rx.battery_update.take(),
+            Some(BatteryInfo {
+                level_percent: 64,
+                charging: true,
+            })
+        );
     }
 }

@@ -1,6 +1,5 @@
-//! Shared configuration and capability model for SmoothMX.
-//! Read-only HID discovery is provided by smoothmx-platform-macos.
-//! Settings changes and input interception are not implemented yet.
+//! Shared device, configuration, and bounded input-policy model for SmoothMX.
+//! The macOS adapter provides discovery plus a reversible HID++ hardware session.
 
 /// Features must be discovered on the connected device before being enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +26,8 @@ pub struct HidInterface {
     pub location_id: u32,
     pub usage_page: u32,
     pub usage: u32,
+    /// Battery level reported by the device (0–100), if the property exists.
+    pub battery_level: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct Device {
     pub transport: String,
     pub kind: &'static str,
     pub interface_count: usize,
+    /// Battery level surfaced by the operating system (0–100), when available.
+    pub battery_level: Option<u8>,
 }
 
 /// Group only USB interfaces sharing a nonzero physical location and VID/PID.
@@ -80,6 +83,9 @@ pub fn group_devices(interfaces: impl IntoIterator<Item = HidInterface>) -> Vec<
                     "unresolved"
                 },
                 interface_count: items.len(),
+                battery_level: chosen
+                    .battery_level
+                    .or_else(|| items.iter().find_map(|item| item.battery_level)),
             }
         })
         .collect()
@@ -104,9 +110,10 @@ pub fn json_string(value: &str) -> String {
 
 pub fn devices_json(devices: &[Device]) -> String {
     let records: Vec<_> = devices.iter().map(|d| format!(
-        "{{\"id\":{},\"name\":{},\"vendor_id\":{},\"product_id\":{},\"transport\":{},\"kind\":{},\"interface_count\":{}}}",
+        "{{\"id\":{},\"name\":{},\"vendor_id\":{},\"product_id\":{},\"transport\":{},\"kind\":{},\"interface_count\":{},\"battery_level\":{}}}",
         json_string(&d.id), json_string(&d.name), d.vendor_id, d.product_id,
         json_string(&d.transport), json_string(d.kind), d.interface_count,
+        d.battery_level.map_or_else(|| "null".into(), |level| level.to_string()),
     )).collect();
     format!(
         "{{\"schema_version\":1,\"devices\":[{}],\"error\":null}}",
@@ -127,6 +134,7 @@ mod tests {
             transport: "USB".into(),
             usage_page: 1,
             usage: 2,
+            battery_level: None,
         }
     }
     #[test]
@@ -163,6 +171,17 @@ mod tests {
     #[test]
     fn escapes_device_supplied_strings() {
         assert_eq!(json_string("a\"\\\n\0é"), "\"a\\\"\\\\\\u000a\\u0000é\"");
+    }
+    #[test]
+    fn preserves_and_serializes_battery_level() {
+        let mut mouse = interface(1, 10, "Mouse");
+        mouse.battery_level = Some(73);
+        let devices = group_devices([mouse]);
+        assert_eq!(devices[0].battery_level, Some(73));
+        assert!(devices_json(&devices).contains("\"battery_level\":73"));
+
+        let devices = group_devices([interface(2, 20, "Mouse")]);
+        assert!(devices_json(&devices).contains("\"battery_level\":null"));
     }
 }
 
