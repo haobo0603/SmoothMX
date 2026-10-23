@@ -17,6 +17,7 @@ let package = Package(
                 .linkedLibrary("smoothmx_platform_macos"),
                 .linkedFramework("IOKit"), .linkedFramework("CoreFoundation")
             ]
-        )
+        ),
+        .testTarget(name: "SmoothMXTests", dependencies: ["SmoothMX"])
     ]
 )

@@ -5,9 +5,11 @@ import Darwin
 struct BatteryInfo: Decodable, Sendable {
     let levelPercent: Int?
     let charging: Bool?
-}
-private struct BatteryWrapper: Decodable {
-    let battery: BatteryInfo?
+
+    private enum CodingKeys: String, CodingKey {
+        case levelPercent = "level_percent"
+        case charging
+    }
 }
 struct HardwareButton: Decodable {
     let id: UInt16
@@ -26,6 +28,7 @@ struct HardwareSnapshot: Decodable {
     let vertical: Bool?
     let horizontal: Bool?
     let buttons: [HardwareButton]?
+    let battery: BatteryInfo?
 }
 
 // All event outputs arrive serially on the Rust worker. No JSON, UI tasks,
@@ -80,33 +83,94 @@ private func hardwareOutput(_ context: UnsafeMutableRawPointer?, _ output: Smoot
     guard let context else { return }
     Unmanaged<HardwareCallbacks>.fromOpaque(context).takeUnretainedValue().output(output)
 }
-final class HardwareSession {
+
+private final class HardwareLifetime: @unchecked Sendable {
+    private enum State { case open, closing, closed }
+    private static let closeQueue = DispatchQueue(
+        label: "org.smoothmx.hardware-close", qos: .userInitiated, attributes: .concurrent)
+    private let condition = NSCondition()
     private let handle: UnsafeMutableRawPointer
     private let context: UnsafeMutableRawPointer
+    private var state = State.open
+
+    init(handle: UnsafeMutableRawPointer, context: UnsafeMutableRawPointer) {
+        self.handle = handle
+        self.context = context
+    }
+
+    func withOpenHandle<T>(_ body: (UnsafeMutableRawPointer) -> T) -> T? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard state == .open else { return nil }
+        return body(handle)
+    }
+
+    func closeEventually() {
+        Self.closeQueue.async { [self] in closeAndWait() }
+    }
+
+    func close() async {
+        await withCheckedContinuation { continuation in
+            Self.closeQueue.async { [self] in
+                closeAndWait()
+                continuation.resume()
+            }
+        }
+    }
+
+    func closeAndWait() {
+        condition.lock()
+        switch state {
+        case .closed:
+            condition.unlock()
+            return
+        case .closing:
+            while state != .closed { condition.wait() }
+            condition.unlock()
+            return
+        case .open:
+            state = .closing
+            condition.unlock()
+        }
+
+        // stop joins the Rust worker. It may issue final callbacks while
+        // restoring, so the retained callback context is released afterward.
+        smoothmx_hardware_stop(handle)
+        Unmanaged<HardwareCallbacks>.fromOpaque(context).release()
+
+        condition.lock()
+        state = .closed
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    deinit { closeAndWait() }
+}
+
+final class HardwareSession: @unchecked Sendable {
+    private let lifetime: HardwareLifetime
     init(registryID: UInt64, receive: @escaping @Sendable (Data) -> Void) throws {
         let context = Unmanaged.passRetained(HardwareCallbacks(snapshot: receive)).toOpaque()
         guard let handle = smoothmx_hardware_start(registryID, hardwareSnapshot, hardwareOutput, context) else {
             Unmanaged<HardwareCallbacks>.fromOpaque(context).release()
             throw ConfigurationError.invalid
         }
-        self.context = context; self.handle = handle
+        lifetime = HardwareLifetime(handle: handle, context: context)
     }
     func apply(_ settings: MouseSettings) throws {
         try settings.validate()
-        guard settings.words.withUnsafeBufferPointer({ smoothmx_hardware_apply(handle, $0.baseAddress, $0.count) }) == 0 else { throw ConfigurationError.invalid }
-    }
-    func restore() { _ = smoothmx_hardware_apply(handle, nil, 0) }
-    static func battery(registryID: UInt64) -> BatteryInfo? {
-        let json = smoothmx_hardware_battery_read(registryID)
-        defer { smoothmx_hardware_free(json) }
-        guard let json, strlen(json) > 0 else { return nil }
-        let data = Data(bytes: json, count: strlen(json))
-        do {
-            let wrapper = try JSONDecoder().decode(BatteryWrapper.self, from: data)
-            return wrapper.battery
-        } catch {
-            return nil
+        let result = lifetime.withOpenHandle { handle in
+            settings.words.withUnsafeBufferPointer {
+                smoothmx_hardware_apply(handle, $0.baseAddress, $0.count)
+            }
         }
+        guard result == 0 else { throw ConfigurationError.invalid }
     }
-    deinit { smoothmx_hardware_stop(handle); Unmanaged<HardwareCallbacks>.fromOpaque(context).release() }
+    func restore() throws {
+        let result = lifetime.withOpenHandle { smoothmx_hardware_apply($0, nil, 0) }
+        guard result == 0 else { throw ConfigurationError.invalid }
+    }
+    func close() async { await lifetime.close() }
+    func closeSynchronously() { lifetime.closeAndWait() }
+    deinit { lifetime.closeEventually() }
 }

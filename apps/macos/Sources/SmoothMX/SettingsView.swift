@@ -7,55 +7,107 @@ struct SettingsView: View {
     @State private var tab = 0
     private var settings: Binding<MouseSettings> { $model.profiles[model.profileIndex].settings }
     private var ready: Bool { model.deviceID == device.id && model.capabilities?.ready == true }
+    private var battery: BatteryInfo? {
+        model.deviceID == device.id ? (model.batteryInfo ?? device.batteryInfo) : device.batteryInfo
+    }
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(device.name).font(.title.bold())
-                    Text(device.transport).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(ready ? "Reconnect settings" : "Read capabilities") { model.connect(device) }
-                    .disabled(model.busy || model.active)
-            }
-            HStack {
-                Picker("Editing profile", selection: $model.selectedProfile) {
-                    ForEach(model.profiles) { Text($0.name).tag($0.id) }
-                }.frame(maxWidth: 380)
-                Spacer()
-                if model.active { Label("Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
-                if model.busy { ProgressView().controlSize(.small) }
-            }
-            HStack(spacing: 24) {
-                if let battery = model.batteryInfo, let level = battery.levelPercent {
+        GeometryReader { geometry in
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
                     VStack(alignment: .leading, spacing: 4) {
-                        Label("\(level)%", systemImage: battery.charging == true ? "batterycharging.full" : "battery.100")
-                            .font(.caption).foregroundStyle(.secondary)
-                        ProgressView(value: Double(level), value: 100)
-                            .progressViewStyle(.linear)
+                        Text(device.name).font(.title.bold())
+                        Text(device.transport).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(ready ? "Reconnect settings" : "Read capabilities") { model.connect(device) }
+                        .disabled(model.busy || model.active)
+                }
+                HStack {
+                    Picker("Editing profile", selection: $model.selectedProfile) {
+                        ForEach(model.profiles) { Text($0.name).tag($0.id) }
+                    }.frame(maxWidth: 380)
+                    Spacer()
+                    if model.active { Label("Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+                    if model.busy { ProgressView().controlSize(.small) }
+                }
+                HStack(spacing: 24) {
+                    if let battery, let level = battery.levelPercent {
+                        BatteryStatusView(level: level, charging: battery.charging)
+                    } else if ready {
+                        Label("Battery unavailable", systemImage: "battery.0")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
+                TabView(selection: $tab) {
+                    pointAndScroll.tabItem { Text("Point & Scroll") }.tag(0)
+                    buttons.tabItem { Text("Buttons & Gestures") }.tag(1)
+                    profiles.tabItem { Text("Application Profiles") }.tag(2)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+                .clipped()
+                footer
             }
-            TabView(selection: $tab) {
-                pointAndScroll.tabItem { Text("Point & Scroll") }.tag(0)
-                buttons.tabItem { Text("Buttons & Gestures") }.tag(1)
-                profiles.tabItem { Text("Application Profiles") }.tag(2)
-            }
+            .padding(20)
+            .frame(
+                width: geometry.size.width,
+                height: geometry.size.height,
+                alignment: .topLeading
+            )
+        }
+        .onAppear { model.refreshPermissions() }
+    }
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Text(model.message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
-                Menu("Permissions") {
-                    Button("Enable Input Monitoring…") { model.requestInputMonitoring() }
-                    Button("Enable Accessibility…") { model.requestAccessibility() }
-                    Button("Recheck permissions") { model.refreshPermissions() }
-                }
-                if !model.accessibility { Text("Actions need Accessibility").font(.caption).foregroundStyle(.secondary) }
+                HStack(spacing: 8) { permissionControls }
+                    .fixedSize(horizontal: true, vertical: false)
                 Spacer()
                 Button("Pause & Restore") { model.pause() }.disabled(!model.active || model.busy)
                 Button("Save & Apply") { model.applySelected() }.buttonStyle(.borderedProminent)
-                    .disabled(!ready || model.busy)
+                    .disabled(!ready || model.busy || !model.inputMonitoring)
             }
-        }.padding(24)
+        }
+    }
+    @ViewBuilder private var permissionControls: some View {
+        if model.inputMonitoring {
+            Menu("Permissions") {
+                Button("Open Input Monitoring settings…") { model.openInputMonitoringSettings() }
+                if model.accessibility {
+                    Button("Open Accessibility settings…") { model.openAccessibilitySettings() }
+                } else {
+                    Button("Request Accessibility") { model.requestAccessibility() }
+                    Button("Open Accessibility settings…") { model.openAccessibilitySettings() }
+                }
+                Button("Recheck permissions") { model.refreshPermissions() }
+            }
+            .frame(width: 105)
+        } else {
+            Button("Request Input Monitoring") { model.requestInputMonitoring() }
+            Button("Open Settings…") { model.openInputMonitoringSettings() }
+            Menu("More…") {
+                if model.accessibility {
+                    Button("Open Accessibility settings…") { model.openAccessibilitySettings() }
+                } else {
+                    Button("Request Accessibility") { model.requestAccessibility() }
+                    Button("Open Accessibility settings…") { model.openAccessibilitySettings() }
+                }
+                Button("Recheck permissions") { model.refreshPermissions() }
+            }
+            .frame(width: 82)
+        }
+        Label(
+            model.inputMonitoring ? "Input Monitoring enabled" : "Input Monitoring required",
+            systemImage: model.inputMonitoring ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+        )
+        .font(.caption)
+        .foregroundStyle(model.inputMonitoring ? Color.secondary : Color.orange)
+        if !model.accessibility {
+            Text("Actions need Accessibility").font(.caption).foregroundStyle(.secondary)
+        }
     }
     private var pointAndScroll: some View {
         Form {
@@ -153,7 +205,7 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("While SmoothMX is running") {
-                Text("Closing the window keeps customization active. Pause & Restore or Quit restores the settings captured when you connected. After a disconnect, reconnect and apply the profile again.")
+                Text("Closing the window keeps customization active. Pause & Restore or Quit restores the settings captured when you connected. After a disconnect, SmoothMX reconnects only when exactly one mouse matches and resumes the saved foreground profile if customization was active.")
                 Text("This development build does not have crash recovery. If it exits unexpectedly while controls are customized, power-cycle the mouse to restore normal reporting.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -164,6 +216,56 @@ struct SettingsView: View {
             Text(title).frame(width: 170, alignment: .leading)
             Slider(value: value, in: range, step: 1)
             Text("\(Int(value.wrappedValue))\(suffix)").monospacedDigit().frame(width: 85, alignment: .trailing)
+        }
+    }
+}
+
+struct BatteryStatusView: View {
+    let level: Int
+    let charging: Bool?
+    var compact = false
+
+    private var boundedLevel: Int { min(100, max(0, level)) }
+    private var icon: String {
+        if charging == true { return "batterycharging.full" }
+        return switch boundedLevel {
+        case 0..<13: "battery.0"
+        case 13..<38: "battery.25"
+        case 38..<63: "battery.50"
+        case 63..<88: "battery.75"
+        default: "battery.100"
+        }
+    }
+    private var color: Color {
+        if charging == true { return .green }
+        if boundedLevel <= 15 { return .red }
+        if boundedLevel <= 30 { return .orange }
+        return .secondary
+    }
+    private var title: String {
+        charging == true ? "Charging · \(boundedLevel)%" : "\(boundedLevel)%"
+    }
+
+    var body: some View {
+        if compact {
+            Label(title, systemImage: icon)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(color)
+                .accessibilityLabel("Mouse battery \(title)")
+        } else {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(title, systemImage: icon)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(color)
+                ProgressView(value: Double(boundedLevel), total: 100)
+                    .progressViewStyle(.linear)
+                    .tint(color)
+                    .frame(width: 170)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Mouse battery \(title)")
         }
     }
 }

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust quality tools
+        run: rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --workspace
+      - name: Build native library for Swift tests
+        run: cargo build --release -p smoothmx-platform-macos
+      - name: Run Swift tests
+        run: swift test --package-path apps/macos
+      - name: Build the signed local preview
+        run: ./scripts/build-macos.sh

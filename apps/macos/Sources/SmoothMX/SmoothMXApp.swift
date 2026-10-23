@@ -23,7 +23,15 @@ struct ContentView: View {
                 Label("Overview", systemImage: "computermouse").tag("overview")
                 Section("Mouse settings") {
                     ForEach(discovery.devices.filter { $0.kind == "mouse" }) { device in
-                        Label(device.name, systemImage: "slider.horizontal.3").tag(device.id)
+                        HStack {
+                            Label(device.name, systemImage: "slider.horizontal.3")
+                            Spacer()
+                            if let battery = battery(for: device), let level = battery.levelPercent {
+                                BatteryStatusView(level: level, charging: battery.charging, compact: true)
+                                    .help(battery.charging == true ? "Charging · \(level)%" : "Battery \(level)%")
+                            }
+                        }
+                        .tag(device.id)
                     }
                 }
             }
@@ -38,6 +46,18 @@ struct ContentView: View {
                         Text("Your devices").font(.largeTitle.bold())
                         Text("Connected Logitech hardware, detected directly by macOS.")
                             .foregroundStyle(.secondary)
+                    }
+                    if !settings.inputMonitoring {
+                        HStack(spacing: 10) {
+                            Label("Input Monitoring is required to read Logitech battery data.", systemImage: "lock.trianglebadge.exclamationmark")
+                                .foregroundStyle(.orange)
+                            Spacer()
+                            Button("Request Access") { settings.requestInputMonitoring() }
+                                .buttonStyle(.borderedProminent)
+                            Button("Open Settings…") { settings.openInputMonitoringSettings() }
+                        }
+                        .padding(14)
+                        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                     }
                     if let error = discovery.error {
                         Label("Discovery unavailable", systemImage: "exclamationmark.triangle")
@@ -54,7 +74,7 @@ struct ContentView: View {
                         }
                     } else {
                         ForEach(discovery.devices) { device in
-                            DeviceCard(device: device)
+                            DeviceCard(device: device, battery: battery(for: device))
                         }
                     }
                     Divider()
@@ -68,18 +88,38 @@ struct ContentView: View {
             }
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                if selected != nil && selected != "overview" {
+                    Button {
+                        selected = "overview"
+                    } label: {
+                        Label("Overview", systemImage: "chevron.left")
+                    }
+                    .help("Return to the connected device list")
+                }
+            }
+        }
         .frame(minWidth: 900, minHeight: 650)
+        .onAppear { settings.devicesChanged(discovery.devices) }
         .onChange(of: discovery.devices.map(\.id)) { _ in settings.devicesChanged(discovery.devices) }
+    }
+
+    private func battery(for device: MouseDevice) -> BatteryInfo? {
+        settings.deviceID == device.id ? (settings.batteryInfo ?? device.batteryInfo) : device.batteryInfo
     }
 }
 
 @MainActor
 final class SmoothMXDelegate: NSObject, NSApplicationDelegate {
-    func applicationWillTerminate(_ notification: Notification) { SettingsModel.shared.shutdown() }
+    func applicationWillTerminate(_ notification: Notification) {
+        SettingsModel.shared.shutdownSynchronously()
+    }
 }
 
 private struct DeviceCard: View {
     let device: MouseDevice
+    let battery: BatteryInfo?
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 16) {
@@ -90,6 +130,10 @@ private struct DeviceCard: View {
                     Text(device.name).font(.title2.bold()).textSelection(.enabled)
                     Label("Connected · \(device.transport)", systemImage: "checkmark.circle.fill")
                         .font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let battery, let level = battery.levelPercent {
+                    BatteryStatusView(level: level, charging: battery.charging)
                 }
             }
             Text(device.detail).foregroundStyle(.secondary)

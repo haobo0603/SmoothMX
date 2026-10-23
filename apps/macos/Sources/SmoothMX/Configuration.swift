@@ -28,6 +28,20 @@ struct MouseAction: Codable, Equatable {
         ("Previous track", .init(kind: 4, code: 18)),
         ("Toggle wheel mode", .init(kind: 5))
     ]
+
+    var needsAccessibility: Bool { kind == 1 || kind == 2 || kind == 4 }
+
+    func validate() throws {
+        let valid = switch kind {
+        case 0: code == 0 && modifiers == 0
+        case 1: code <= 127 && modifiers <= 15
+        case 2: code <= 4 && modifiers == 0
+        case 4: [0, 1, 7, 16, 17, 18].contains(code) && modifiers == 0
+        case 5: code == 0 && modifiers == 0
+        default: false
+        }
+        guard valid else { throw ConfigurationError.invalid }
+    }
 }
 struct ButtonBinding: Codable, Equatable {
     var enabled = false
@@ -49,7 +63,18 @@ struct MouseSettings: Codable, Equatable {
     var horizontalActions = [MouseAction(), MouseAction()]
     var gestureThreshold: Double = 80
     var buttons = Array(repeating: ButtonBinding(), count: 5)
-    var needsAccessibility: Bool { vertical || horizontal || buttons.contains { $0.enabled } }
+    var needsAccessibility: Bool {
+        if vertical { return true }
+        if horizontal {
+            let configured = horizontalActions.contains { $0.kind != 0 }
+            if !configured || horizontalActions.contains(where: \.needsAccessibility) { return true }
+        }
+        return buttons.contains { binding in
+            guard binding.enabled else { return false }
+            let actions = binding.gesture ? binding.actions[...] : binding.actions.prefix(1)
+            return actions.contains(where: \.needsAccessibility)
+        }
+    }
     var words: [UInt32] {
         var w = Array(repeating: UInt32(0), count: 105)
         w[0] = 1; w[1] = dpi; w[2] = smartShift ? 2 : wheelMode
@@ -72,6 +97,10 @@ struct MouseSettings: Codable, Equatable {
               (10...500).contains(verticalSpeed), horizontalSpeed.isFinite, (10...500).contains(horizontalSpeed),
               gestureThreshold.isFinite, (10...2000).contains(gestureThreshold), dpi <= 57343,
               (1...2).contains(wheelMode) else { throw ConfigurationError.invalid }
+        for action in horizontalActions { try action.validate() }
+        for binding in buttons {
+            for action in binding.actions { try action.validate() }
+        }
     }
 }
 enum ConfigurationError: Error { case invalid }

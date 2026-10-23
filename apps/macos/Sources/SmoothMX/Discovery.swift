@@ -9,6 +9,11 @@ struct MouseDevice: Decodable, Identifiable {
     let transport: String
     let kind: String
     let interface_count: Int
+    let battery_level: Int?
+
+    var batteryInfo: BatteryInfo? {
+        battery_level.map { BatteryInfo(levelPercent: $0, charging: nil) }
+    }
 
     var detail: String {
         switch kind {
