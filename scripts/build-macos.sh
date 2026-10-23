@@ -29,3 +29,5 @@ print(f'Built {contents.parent.resolve()}')
 PY
 # Local ad-hoc signature only; this is not a notarized distribution build.
 codesign --force --sign - .build/SmoothMX.app
+plutil -lint .build/SmoothMX.app/Contents/Info.plist
+codesign --verify --strict --verbose=2 .build/SmoothMX.app
